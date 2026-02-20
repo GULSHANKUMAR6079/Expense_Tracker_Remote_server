@@ -1,8 +1,11 @@
 """
 MCP tool implementations for expense management.
 
-Uses FastMCP Context for elicitation — if a required field is missing,
-the server prompts the user interactively before proceeding.
+All tools receive ``user_id`` as the first argument, which is resolved
+from the authenticated user's API key by middleware in ``main.py``.
+
+Uses FastMCP Context for elicitation — the server prompts the user
+for missing fields interactively when possible.
 """
 
 from __future__ import annotations
@@ -26,16 +29,18 @@ from db import database as db
 
 logger = logging.getLogger("expense_tracker.tools.expenses")
 
+# Module-level default user_id (set by main.py on startup for stdio)
+_DEFAULT_USER_ID: int = 1
+
+
+def set_default_user_id(uid: int) -> None:
+    global _DEFAULT_USER_ID
+    _DEFAULT_USER_ID = uid
+
 
 # ---------------------------------------------------------------------------
 # Elicitation helpers
 # ---------------------------------------------------------------------------
-
-@dataclass
-class ConfirmDelete:
-    """Elicitation schema for delete confirmation."""
-    confirm: str
-
 
 async def _elicit_missing_fields(
     ctx: Context,
@@ -44,7 +49,7 @@ async def _elicit_missing_fields(
     category: str | None,
     date: str | None,
 ) -> tuple[str | None, float | None, str | None, str | None]:
-    """Prompt the user for any missing required expense fields via elicitation."""
+    """Prompt the user for any missing required expense fields."""
     if not title:
         result = await ctx.elicit("What is the expense title?", response_type=str)
         if result.action == "accept":
@@ -58,8 +63,7 @@ async def _elicit_missing_fields(
     if not category:
         cats = [c.value for c in CategoryEnum]
         result = await ctx.elicit(
-            f"Choose a category: {', '.join(cats)}",
-            response_type=cats,
+            f"Choose a category: {', '.join(cats)}", response_type=cats,
         )
         if result.action == "accept":
             category = result.data
@@ -67,8 +71,7 @@ async def _elicit_missing_fields(
     if not date:
         today = datetime.utcnow().strftime("%Y-%m-%d")
         result = await ctx.elicit(
-            f"What date? (YYYY-MM-DD, default: {today})",
-            response_type=str,
+            f"What date? (YYYY-MM-DD, default: {today})", response_type=str,
         )
         if result.action == "accept":
             date = result.data or today
@@ -103,7 +106,6 @@ async def add_expense(
     Returns:
         The created expense record with its new ID.
     """
-    # Elicit missing required fields if context is available
     if ctx and (not title or not amount or not category or not date):
         title, amount, category, date = await _elicit_missing_fields(
             ctx, title, amount, category, date
@@ -111,11 +113,7 @@ async def add_expense(
 
     try:
         validated = AddExpenseInput(
-            title=title,
-            amount=amount,
-            category=category,
-            date=date,
-            notes=notes,
+            title=title, amount=amount, category=category, date=date, notes=notes,
         )
     except Exception as e:
         logger.warning("Validation failed for add_expense: %s", e)
@@ -123,6 +121,7 @@ async def add_expense(
 
     try:
         record = await db.insert_expense(
+            user_id=_DEFAULT_USER_ID,
             title=validated.title,
             amount=validated.amount,
             category=validated.category.value,
@@ -159,10 +158,7 @@ async def get_expenses(
     """
     try:
         validated = GetExpensesInput(
-            category=category,
-            start_date=start_date,
-            end_date=end_date,
-            limit=limit,
+            category=category, start_date=start_date, end_date=end_date, limit=limit,
         )
     except Exception as e:
         logger.warning("Validation failed for get_expenses: %s", e)
@@ -170,6 +166,7 @@ async def get_expenses(
 
     try:
         rows = await db.fetch_expenses(
+            user_id=_DEFAULT_USER_ID,
             category=validated.category.value if validated.category else None,
             start_date=validated.start_date,
             end_date=validated.end_date,
@@ -208,18 +205,13 @@ async def update_expense(
     """
     try:
         validated = UpdateExpenseInput(
-            id=id,
-            title=title,
-            amount=amount,
-            category=category,
-            date=date,
-            notes=notes,
+            id=id, title=title, amount=amount, category=category, date=date, notes=notes,
         )
     except Exception as e:
         logger.warning("Validation failed for update_expense: %s", e)
         return {"error": f"Validation error: {e}"}
 
-    existing = await db.fetch_expense_by_id(validated.id)
+    existing = await db.fetch_expense_by_id(_DEFAULT_USER_ID, validated.id)
     if not existing:
         return {"error": f"Expense with ID {validated.id} not found."}
 
@@ -239,7 +231,7 @@ async def update_expense(
         return {"message": "No fields to update.", "expense": existing}
 
     try:
-        updated = await db.update_expense(validated.id, **fields)
+        updated = await db.update_expense(_DEFAULT_USER_ID, validated.id, **fields)
         logger.info("Updated expense #%s", validated.id)
         return {"message": "Expense updated successfully.", "expense": updated}
     except Exception as e:
@@ -267,9 +259,8 @@ async def delete_expense(id: int, ctx: Context | None = None) -> dict:
         logger.warning("Validation failed for delete_expense: %s", e)
         return {"error": f"Validation error: {e}"}
 
-    # Confirm deletion with the user via elicitation
     if ctx:
-        existing = await db.fetch_expense_by_id(validated.id)
+        existing = await db.fetch_expense_by_id(_DEFAULT_USER_ID, validated.id)
         if not existing:
             return {"error": f"Expense with ID {validated.id} not found."}
 
@@ -283,7 +274,7 @@ async def delete_expense(id: int, ctx: Context | None = None) -> dict:
             return {"message": "Deletion cancelled by user."}
 
     try:
-        deleted = await db.delete_expense(validated.id)
+        deleted = await db.delete_expense(_DEFAULT_USER_ID, validated.id)
         if deleted:
             logger.info("Deleted expense #%s", validated.id)
             return {"message": f"Expense #{validated.id} deleted successfully."}
@@ -326,14 +317,13 @@ async def get_summary(period: str | None = "monthly") -> dict:
         end_date = today.isoformat()
 
     try:
-        rows = await db.fetch_spending_summary(start_date=start_date, end_date=end_date)
+        rows = await db.fetch_spending_summary(
+            user_id=_DEFAULT_USER_ID, start_date=start_date, end_date=end_date,
+        )
         grand_total = sum(r["total_spent"] for r in rows)
         return {
-            "period": validated.period,
-            "start_date": start_date,
-            "end_date": end_date,
-            "grand_total": round(grand_total, 2),
-            "categories": rows,
+            "period": validated.period, "start_date": start_date, "end_date": end_date,
+            "grand_total": round(grand_total, 2), "categories": rows,
         }
     except Exception as e:
         logger.error("Database error in get_summary: %s", e)
@@ -360,7 +350,7 @@ async def get_top_expenses(n: int | None = 5) -> dict:
         return {"error": f"Validation error: {e}"}
 
     try:
-        rows = await db.fetch_top_expenses(validated.n or 5)
+        rows = await db.fetch_top_expenses(_DEFAULT_USER_ID, validated.n or 5)
         return {"count": len(rows), "expenses": rows}
     except Exception as e:
         logger.error("Database error in get_top_expenses: %s", e)

@@ -1,9 +1,14 @@
 """
-Expense Tracker MCP Server — main entry point.
+Expense Tracker — FastMCP Server (main entry-point)
 
-Creates a FastMCP server instance, registers all tools and resources,
-configures logging, initialises the MySQL database, and exposes the
-server over stdio transport for Claude Desktop.
+Runs as a local **stdio** MCP server by default.
+For HTTP access use the companion ``proxy_server.py``.
+
+Features:
+  • 8 MCP tools (expense + budget CRUD)
+  • 4 MCP resources (read-only views)
+  • Multi-user support via API-key authentication
+  • Interactive elicitation for missing fields
 """
 
 from __future__ import annotations
@@ -15,10 +20,9 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Bootstrap — load .env and fix sys.path so local packages resolve
+# Bootstrap — env + sys.path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -33,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _configure_logging() -> None:
-    """Set up dual logging: console + file (if writable)."""
+    """Set up console + optional file logging."""
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 
     fmt = logging.Formatter(
@@ -41,7 +45,6 @@ def _configure_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Console handler (stderr so it doesn't interfere with stdio transport)
     ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(log_level)
     ch.setFormatter(fmt)
@@ -50,7 +53,6 @@ def _configure_logging() -> None:
     root.setLevel(log_level)
     root.addHandler(ch)
 
-    # File handler — try project logs/, then /tmp, skip if read-only
     for log_path in [PROJECT_ROOT / "logs", Path("/tmp")]:
         try:
             log_path.mkdir(exist_ok=True)
@@ -67,30 +69,64 @@ _configure_logging()
 logger = logging.getLogger("expense_tracker")
 
 # ---------------------------------------------------------------------------
-# FastMCP server instance
+# FastMCP server
 # ---------------------------------------------------------------------------
 
+from fastmcp import FastMCP
+
 mcp = FastMCP(
-    "Expense Tracker",
+    name="Expense Tracker",
     instructions=(
-        "A production-level MCP server for tracking personal expenses, "
-        "managing budgets, and generating spending summaries. "
-        "Backed by a MySQL database."
+        "A personal expense tracking assistant.\n\n"
+        "TOOLS:\n"
+        "  • add_expense     — record a new expense\n"
+        "  • get_expenses    — list / filter expenses\n"
+        "  • update_expense  — edit an expense by ID\n"
+        "  • delete_expense  — remove an expense (with confirmation)\n"
+        "  • get_summary     — spending summary by category\n"
+        "  • get_top_expenses— highest expenses\n"
+        "  • set_budget      — set a monthly budget per category\n"
+        "  • get_budget_status— compare budget vs actual\n"
+        "  • register_user   — create a new user (returns API key)\n"
+        "  • switch_user     — switch active user by API key\n"
+        "  • list_users      — list all registered users\n\n"
+        "RESOURCES (read-only):\n"
+        "  expense://all, expense://summary,\n"
+        "  expense://categories, budget://status"
     ),
 )
 
 # ---------------------------------------------------------------------------
-# Register Tools — Expenses
+# Imports — tools, resources, db
 # ---------------------------------------------------------------------------
 
-from tools.expenses import (          # noqa: E402
-    add_expense,
-    delete_expense,
-    get_expenses,
-    get_summary,
-    get_top_expenses,
-    update_expense,
+from db.database import init_db, create_user, authenticate_user, list_users as db_list_users
+from tools.expenses import (
+    add_expense, get_expenses, update_expense, delete_expense,
+    get_summary, get_top_expenses,
+    set_default_user_id as set_expense_user_id,
 )
+from tools.budgets import (
+    set_budget, get_budget_status,
+    set_default_user_id as set_budget_user_id,
+)
+from resources.expense_resources import (
+    get_all_expenses, get_expense_summary, get_categories,
+    get_budget_status_resource,
+    set_default_user_id as set_resource_user_id,
+)
+
+
+def _set_active_user(user_id: int) -> None:
+    """Propagate the active user_id to all modules."""
+    set_expense_user_id(user_id)
+    set_budget_user_id(user_id)
+    set_resource_user_id(user_id)
+
+
+# ---------------------------------------------------------------------------
+# Register expense & budget tools
+# ---------------------------------------------------------------------------
 
 mcp.tool()(add_expense)
 mcp.tool()(get_expenses)
@@ -98,41 +134,95 @@ mcp.tool()(update_expense)
 mcp.tool()(delete_expense)
 mcp.tool()(get_summary)
 mcp.tool()(get_top_expenses)
-
-# ---------------------------------------------------------------------------
-# Register Tools — Budgets
-# ---------------------------------------------------------------------------
-
-from tools.budgets import get_budget_status, set_budget  # noqa: E402
-
 mcp.tool()(set_budget)
 mcp.tool()(get_budget_status)
 
 # ---------------------------------------------------------------------------
-# Register Resources
+# User management tools
 # ---------------------------------------------------------------------------
 
-from resources.expense_resources import (  # noqa: E402
-    get_all_expenses,
-    get_budget_status_resource,
-    get_categories,
-    get_expense_summary,
-)
+
+@mcp.tool()
+async def register_user(name: str, email: str | None = None) -> dict:
+    """Register a new user and receive their unique API key.
+
+    Args:
+        name: User's display name.
+        email: Optional email address.
+
+    Returns:
+        The new user record with their API key. Save this key!
+    """
+    try:
+        user = await create_user(name=name, email=email)
+        logger.info("Registered new user: %s (id=%s)", name, user["id"])
+        return {
+            "message": f"User '{name}' registered successfully!",
+            "user": user,
+            "note": "Save your API key — you'll need it to switch users.",
+        }
+    except Exception as e:
+        logger.error("Failed to register user: %s", e)
+        return {"error": f"Failed to register user: {e}"}
+
+
+@mcp.tool()
+async def switch_user(api_key: str) -> dict:
+    """Switch the active user by providing an API key.
+
+    Args:
+        api_key: The user's API key received during registration.
+
+    Returns:
+        Confirmation with user details, or error if the key is invalid.
+    """
+    user = await authenticate_user(api_key)
+    if not user:
+        return {"error": "Invalid API key. Use register_user to create an account."}
+
+    _set_active_user(user["id"])
+    logger.info("Switched to user: %s (id=%s)", user["name"], user["id"])
+    return {
+        "message": f"Switched to user '{user['name']}'.",
+        "user": {"id": user["id"], "name": user["name"], "email": user.get("email")},
+    }
+
+
+@mcp.tool()
+async def list_users() -> dict:
+    """List all registered users (API keys are hidden).
+
+    Returns:
+        List of users with their ID, name, email, and creation date.
+    """
+    try:
+        users = await db_list_users()
+        return {"count": len(users), "users": users}
+    except Exception as e:
+        logger.error("Failed to list users: %s", e)
+        return {"error": f"Failed to list users: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Register resources
+# ---------------------------------------------------------------------------
 
 mcp.resource("expense://all")(get_all_expenses)
 mcp.resource("expense://summary")(get_expense_summary)
 mcp.resource("expense://categories")(get_categories)
 mcp.resource("budget://status")(get_budget_status_resource)
 
-# ---------------------------------------------------------------------------
-# Startup — initialise database then run server
-# ---------------------------------------------------------------------------
 
-from db.database import init_db  # noqa: E402
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logger.info("Launching Expense Tracker MCP server (stdio transport)…")
-    # Ensure database is initialised before the server starts listening
+    logger.info("Initialising database ...")
     asyncio.run(init_db())
-    mcp.run(transport="stdio")
+
+    # Set default user to user #1 (auto-created on first run)
+    _set_active_user(1)
+
+    logger.info("Starting Expense Tracker MCP server (stdio) ...")
+    mcp.run()

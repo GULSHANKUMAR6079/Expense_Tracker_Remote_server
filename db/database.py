@@ -1,21 +1,22 @@
 """
 Database layer for the Expense Tracker MCP server.
 
-Supports **two backends** selected by the ``DB_BACKEND`` env var:
+Supports **two backends** selected by environment:
+* ``mysql``  — Uses aiomysql (when MYSQL_PASSWORD is set)
+* ``sqlite`` — Uses aiosqlite (default fallback)
 
-* ``mysql``  — Uses aiomysql (default when MYSQL_PASSWORD is set)
-* ``sqlite`` — Uses aiosqlite  (default fallback / FastMCP Cloud)
-
-All CRUD functions are backend-agnostic; the internal helpers
-abstract away the differences.
+**Multi-user support**: All expenses and budgets are scoped to a
+``user_id``.  The ``users`` table stores API keys for authentication.
 
 Call ``init_db()`` on server startup to auto-create tables.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -27,22 +28,20 @@ logger = logging.getLogger("expense_tracker.db")
 # ---------------------------------------------------------------------------
 
 def _use_mysql() -> bool:
-    """Return True if we should use the MySQL backend."""
     explicit = os.getenv("DB_BACKEND", "").lower()
     if explicit == "mysql":
         return True
     if explicit == "sqlite":
         return False
-    # Auto-detect: use MySQL only if password is configured
     return bool(os.getenv("MYSQL_PASSWORD"))
 
 
 USE_MYSQL = _use_mysql()
 
 if USE_MYSQL:
-    import aiomysql        # type: ignore[import-untyped]
+    import aiomysql
 else:
-    import aiosqlite       # type: ignore[import-untyped]
+    import aiosqlite
 
 logger.info("Database backend: %s", "MySQL" if USE_MYSQL else "SQLite")
 
@@ -50,8 +49,6 @@ logger.info("Database backend: %s", "MySQL" if USE_MYSQL else "SQLite")
 # ═══════════════════════════════════════════════════════════════════════════
 # Connection helpers
 # ═══════════════════════════════════════════════════════════════════════════
-
-# ---- MySQL ----------------------------------------------------------------
 
 def _get_mysql_params() -> dict[str, Any]:
     return {
@@ -64,7 +61,7 @@ def _get_mysql_params() -> dict[str, Any]:
     }
 
 
-async def _mysql_connection() -> aiomysql.Connection:
+async def _mysql_connection():
     return await aiomysql.connect(**_get_mysql_params())
 
 
@@ -83,8 +80,6 @@ async def _mysql_ensure_database() -> None:
         conn.close()
 
 
-# ---- SQLite ---------------------------------------------------------------
-
 def _get_sqlite_path() -> str:
     db_path = os.getenv("DATABASE_PATH", "expenses.db")
     if not os.path.isabs(db_path):
@@ -92,7 +87,7 @@ def _get_sqlite_path() -> str:
     return db_path
 
 
-async def _sqlite_connection() -> aiosqlite.Connection:
+async def _sqlite_connection():
     conn = await aiosqlite.connect(_get_sqlite_path())
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode=WAL;")
@@ -101,12 +96,26 @@ async def _sqlite_connection() -> aiosqlite.Connection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Schema initialisation
+# Schema
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ---- MySQL ----------------------------------------------------------------
+
+_MYSQL_USERS_TABLE = """
+CREATE TABLE IF NOT EXISTS users (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(100)   NOT NULL,
+    email       VARCHAR(200),
+    api_key     VARCHAR(64)    NOT NULL UNIQUE,
+    created_at  DATETIME       NOT NULL,
+    INDEX idx_api_key (api_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
 
 _MYSQL_EXPENSES_TABLE = """
 CREATE TABLE IF NOT EXISTS expenses (
     id          INT AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT            NOT NULL,
     title       VARCHAR(200)   NOT NULL,
     amount      DECIMAL(12,2)  NOT NULL,
     category    VARCHAR(50)    NOT NULL,
@@ -114,48 +123,70 @@ CREATE TABLE IF NOT EXISTS expenses (
     notes       VARCHAR(500),
     created_at  DATETIME       NOT NULL,
     updated_at  DATETIME       NOT NULL,
+    INDEX idx_user_id (user_id),
     INDEX idx_category (category),
-    INDEX idx_date (date)
+    INDEX idx_date (date),
+    FOREIGN KEY (user_id) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 _MYSQL_BUDGETS_TABLE = """
 CREATE TABLE IF NOT EXISTS budgets (
     id            INT AUTO_INCREMENT PRIMARY KEY,
+    user_id       INT            NOT NULL,
     category      VARCHAR(50)    NOT NULL,
     limit_amount  DECIMAL(12,2)  NOT NULL,
     month         INT            NOT NULL,
     year          INT            NOT NULL,
-    UNIQUE KEY uq_cat_month_year (category, month, year),
-    INDEX idx_month_year (month, year)
+    UNIQUE KEY uq_user_cat_month_year (user_id, category, month, year),
+    INDEX idx_month_year (month, year),
+    FOREIGN KEY (user_id) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+# ---- SQLite ---------------------------------------------------------------
+
+_SQLITE_USERS_TABLE = """
+CREATE TABLE IF NOT EXISTS users (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    email       TEXT,
+    api_key     TEXT    NOT NULL UNIQUE,
+    created_at  TEXT    NOT NULL
+);
 """
 
 _SQLITE_EXPENSES_TABLE = """
 CREATE TABLE IF NOT EXISTS expenses (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
     title       TEXT    NOT NULL,
     amount      REAL    NOT NULL,
     category    TEXT    NOT NULL,
     date        TEXT    NOT NULL,
     notes       TEXT,
     created_at  TEXT    NOT NULL,
-    updated_at  TEXT    NOT NULL
+    updated_at  TEXT    NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
 );
 """
 
 _SQLITE_BUDGETS_TABLE = """
 CREATE TABLE IF NOT EXISTS budgets (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
     category      TEXT    NOT NULL,
     limit_amount  REAL    NOT NULL,
     month         INTEGER NOT NULL,
     year          INTEGER NOT NULL,
-    UNIQUE(category, month, year)
+    UNIQUE(user_id, category, month, year),
+    FOREIGN KEY (user_id) REFERENCES users(id)
 );
 """
 
 _SQLITE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);",
+    "CREATE INDEX IF NOT EXISTS idx_expenses_user_id ON expenses(user_id);",
     "CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);",
     "CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);",
     "CREATE INDEX IF NOT EXISTS idx_budgets_month_year ON budgets(month, year);",
@@ -163,52 +194,58 @@ _SQLITE_INDEXES = [
 
 
 async def init_db() -> None:
-    """Create the database (if needed) and tables."""
+    """Create the database (if needed) and all tables."""
     if USE_MYSQL:
         await _mysql_ensure_database()
-        db_name = os.getenv("MYSQL_DATABASE", "expense_tracker")
-        logger.info("Initialising MySQL database '%s'", db_name)
+        logger.info("Initialising MySQL database '%s'",
+                     os.getenv("MYSQL_DATABASE", "expense_tracker"))
         conn = await _mysql_connection()
         try:
             async with conn.cursor() as cur:
+                await cur.execute(_MYSQL_USERS_TABLE)
                 await cur.execute(_MYSQL_EXPENSES_TABLE)
                 await cur.execute(_MYSQL_BUDGETS_TABLE)
             await conn.commit()
         finally:
             conn.close()
     else:
-        db_path = _get_sqlite_path()
-        logger.info("Initialising SQLite database at %s", db_path)
-        async with aiosqlite.connect(db_path) as conn:
+        logger.info("Initialising SQLite database at %s", _get_sqlite_path())
+        async with aiosqlite.connect(_get_sqlite_path()) as conn:
+            await conn.execute(_SQLITE_USERS_TABLE)
             await conn.execute(_SQLITE_EXPENSES_TABLE)
             await conn.execute(_SQLITE_BUDGETS_TABLE)
             for idx in _SQLITE_INDEXES:
                 await conn.execute(idx)
             await conn.commit()
 
+    # Create a default user if none exists
+    await _ensure_default_user()
     logger.info("Database initialised successfully.")
 
 
+async def _ensure_default_user() -> None:
+    """Create a default user for local/stdio usage if no users exist."""
+    users = await _fetchall("SELECT id FROM users")
+    if not users:
+        default_key = os.getenv("DEFAULT_API_KEY", "default-local-key")
+        await create_user("Default User", "local@localhost", default_key)
+        logger.info("Created default user with API key: %s", default_key)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-# Internal helpers — abstract away backend differences
+# Internal helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _ph(name: str = "") -> str:
-    """Return the placeholder string for the current backend."""
-    return "%s" if USE_MYSQL else "?"
+P = "%s" if USE_MYSQL else "?"
 
 
 def _phs(count: int) -> str:
-    """Return comma-separated placeholders."""
-    p = "%s" if USE_MYSQL else "?"
-    return ", ".join(p for _ in range(count))
+    return ", ".join(P for _ in range(count))
 
 
 def _serialise_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert Decimal / date / datetime to JSON-safe types."""
     import decimal
     from datetime import date as date_type, datetime as dt_type
-
     out: dict[str, Any] = {}
     for k, v in row.items():
         if isinstance(v, dt_type):
@@ -256,7 +293,6 @@ async def _fetchone(query: str, params: tuple | list = ()) -> Optional[dict[str,
 
 
 async def _execute(query: str, params: tuple | list = ()) -> tuple[int, int]:
-    """Execute an INSERT/UPDATE/DELETE. Returns (lastrowid, rowcount)."""
     if USE_MYSQL:
         conn = await _mysql_connection()
         try:
@@ -275,13 +311,44 @@ async def _execute(query: str, params: tuple | list = ()) -> tuple[int, int]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CRUD — Expenses
+# CRUD — Users / Authentication
 # ═══════════════════════════════════════════════════════════════════════════
 
-P = "%s" if USE_MYSQL else "?"   # module-level shorthand
+async def create_user(
+    name: str,
+    email: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """Create a new user with a unique API key. Returns the user record."""
+    if not api_key:
+        api_key = secrets.token_hex(32)  # 64-char hex key
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+    lid, _ = await _execute(
+        f"INSERT INTO users (name, email, api_key, created_at) VALUES ({P}, {P}, {P}, {P})",
+        (name, email, api_key, now),
+    )
+    return {"id": lid, "name": name, "email": email, "api_key": api_key, "created_at": now}
+
+
+async def authenticate_user(api_key: str) -> Optional[dict[str, Any]]:
+    """Look up a user by API key. Returns user dict or None."""
+    row = await _fetchone(f"SELECT * FROM users WHERE api_key = {P}", (api_key,))
+    return _serialise_row(row) if row else None
+
+
+async def list_users() -> list[dict[str, Any]]:
+    """List all users (without exposing full API keys)."""
+    rows = await _fetchall("SELECT id, name, email, created_at FROM users")
+    return [_serialise_row(r) for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CRUD — Expenses (scoped by user_id)
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def insert_expense(
+    user_id: int,
     title: str,
     amount: float,
     category: str,
@@ -291,26 +358,27 @@ async def insert_expense(
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     lid, _ = await _execute(
         f"""
-        INSERT INTO expenses (title, amount, category, date, notes, created_at, updated_at)
-        VALUES ({P}, {P}, {P}, {P}, {P}, {P}, {P})
+        INSERT INTO expenses (user_id, title, amount, category, date, notes, created_at, updated_at)
+        VALUES ({P}, {P}, {P}, {P}, {P}, {P}, {P}, {P})
         """,
-        (title, amount, category, date, notes, now, now),
+        (user_id, title, amount, category, date, notes, now, now),
     )
     return {
-        "id": lid, "title": title, "amount": amount,
+        "id": lid, "user_id": user_id, "title": title, "amount": amount,
         "category": category, "date": date, "notes": notes,
         "created_at": now, "updated_at": now,
     }
 
 
 async def fetch_expenses(
+    user_id: int,
     category: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    query = "SELECT * FROM expenses WHERE 1=1"
-    params: list[Any] = []
+    query = f"SELECT * FROM expenses WHERE user_id = {P}"
+    params: list[Any] = [user_id]
     if category:
         query += f" AND category = {P}"
         params.append(category)
@@ -322,43 +390,47 @@ async def fetch_expenses(
         params.append(end_date)
     query += f" ORDER BY date DESC LIMIT {P}"
     params.append(limit)
-
     rows = await _fetchall(query, params)
     return [_serialise_row(r) for r in rows]
 
 
-async def fetch_expense_by_id(expense_id: int) -> Optional[dict[str, Any]]:
-    row = await _fetchone(f"SELECT * FROM expenses WHERE id = {P}", (expense_id,))
+async def fetch_expense_by_id(user_id: int, expense_id: int) -> Optional[dict[str, Any]]:
+    row = await _fetchone(
+        f"SELECT * FROM expenses WHERE id = {P} AND user_id = {P}",
+        (expense_id, user_id),
+    )
     return _serialise_row(row) if row else None
 
 
-async def update_expense(expense_id: int, **fields: Any) -> Optional[dict[str, Any]]:
+async def update_expense(user_id: int, expense_id: int, **fields: Any) -> Optional[dict[str, Any]]:
     if not fields:
-        return await fetch_expense_by_id(expense_id)
+        return await fetch_expense_by_id(user_id, expense_id)
     fields["updated_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     set_clause = ", ".join(f"{k} = {P}" for k in fields)
-    values = list(fields.values()) + [expense_id]
-    await _execute(f"UPDATE expenses SET {set_clause} WHERE id = {P}", values)
-    return await fetch_expense_by_id(expense_id)
+    values = list(fields.values()) + [expense_id, user_id]
+    await _execute(f"UPDATE expenses SET {set_clause} WHERE id = {P} AND user_id = {P}", values)
+    return await fetch_expense_by_id(user_id, expense_id)
 
 
-async def delete_expense(expense_id: int) -> bool:
-    _, rc = await _execute(f"DELETE FROM expenses WHERE id = {P}", (expense_id,))
+async def delete_expense(user_id: int, expense_id: int) -> bool:
+    _, rc = await _execute(
+        f"DELETE FROM expenses WHERE id = {P} AND user_id = {P}",
+        (expense_id, user_id),
+    )
     return rc > 0
 
 
 async def fetch_spending_summary(
+    user_id: int,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     sum_expr = "CAST(SUM(amount) AS DOUBLE)" if USE_MYSQL else "SUM(amount)"
     query = f"""
-        SELECT category,
-               {sum_expr} AS total_spent,
-               COUNT(*)   AS transaction_count
-        FROM expenses WHERE 1=1
+        SELECT category, {sum_expr} AS total_spent, COUNT(*) AS transaction_count
+        FROM expenses WHERE user_id = {P}
     """
-    params: list[Any] = []
+    params: list[Any] = [user_id]
     if start_date:
         query += f" AND date >= {P}"
         params.append(start_date)
@@ -370,25 +442,28 @@ async def fetch_spending_summary(
     return [_serialise_row(r) for r in rows]
 
 
-async def fetch_top_expenses(n: int = 5) -> list[dict[str, Any]]:
+async def fetch_top_expenses(user_id: int, n: int = 5) -> list[dict[str, Any]]:
     rows = await _fetchall(
-        f"SELECT * FROM expenses ORDER BY amount DESC LIMIT {P}", (n,)
+        f"SELECT * FROM expenses WHERE user_id = {P} ORDER BY amount DESC LIMIT {P}",
+        (user_id, n),
     )
     return [_serialise_row(r) for r in rows]
 
 
-async def fetch_all_categories() -> list[str]:
+async def fetch_all_categories(user_id: int) -> list[str]:
     rows = await _fetchall(
-        "SELECT DISTINCT category FROM expenses ORDER BY category"
+        f"SELECT DISTINCT category FROM expenses WHERE user_id = {P} ORDER BY category",
+        (user_id,),
     )
     return [row["category"] for row in rows]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CRUD — Budgets
+# CRUD — Budgets (scoped by user_id)
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def upsert_budget(
+    user_id: int,
     category: str,
     limit_amount: float,
     month: int,
@@ -397,45 +472,41 @@ async def upsert_budget(
     if USE_MYSQL:
         await _execute(
             f"""
-            INSERT INTO budgets (category, limit_amount, month, year)
-            VALUES ({P}, {P}, {P}, {P})
+            INSERT INTO budgets (user_id, category, limit_amount, month, year)
+            VALUES ({P}, {P}, {P}, {P}, {P})
             ON DUPLICATE KEY UPDATE limit_amount = VALUES(limit_amount)
             """,
-            (category, limit_amount, month, year),
+            (user_id, category, limit_amount, month, year),
         )
     else:
         await _execute(
             f"""
-            INSERT INTO budgets (category, limit_amount, month, year)
-            VALUES ({P}, {P}, {P}, {P})
-            ON CONFLICT(category, month, year)
+            INSERT INTO budgets (user_id, category, limit_amount, month, year)
+            VALUES ({P}, {P}, {P}, {P}, {P})
+            ON CONFLICT(user_id, category, month, year)
             DO UPDATE SET limit_amount = excluded.limit_amount
             """,
-            (category, limit_amount, month, year),
+            (user_id, category, limit_amount, month, year),
         )
 
     row = await _fetchone(
-        f"SELECT * FROM budgets WHERE category = {P} AND month = {P} AND year = {P}",
-        (category, month, year),
+        f"SELECT * FROM budgets WHERE user_id = {P} AND category = {P} AND month = {P} AND year = {P}",
+        (user_id, category, month, year),
     )
     return _serialise_row(row) if row else {}
 
 
-async def fetch_budget_status(month: int, year: int) -> list[dict[str, Any]]:
+async def fetch_budget_status(user_id: int, month: int, year: int) -> list[dict[str, Any]]:
     budgets = await _fetchall(
-        f"SELECT * FROM budgets WHERE month = {P} AND year = {P}",
-        (month, year),
+        f"SELECT * FROM budgets WHERE user_id = {P} AND month = {P} AND year = {P}",
+        (user_id, month, year),
     )
     if not budgets:
         return []
-
     budgets = [_serialise_row(b) for b in budgets]
 
     start_date = f"{year}-{month:02d}-01"
-    if month == 12:
-        end_date = f"{year + 1}-01-01"
-    else:
-        end_date = f"{year}-{month + 1:02d}-01"
+    end_date = f"{year + 1}-01-01" if month == 12 else f"{year}-{month + 1:02d}-01"
 
     placeholders = _phs(len(budgets))
     categories = [b["category"] for b in budgets]
@@ -445,11 +516,11 @@ async def fetch_budget_status(month: int, year: int) -> list[dict[str, Any]]:
         f"""
         SELECT category, {sum_expr} AS total_spent
         FROM expenses
-        WHERE category IN ({placeholders})
+        WHERE user_id = {P} AND category IN ({placeholders})
           AND date >= {P} AND date < {P}
         GROUP BY category
         """,
-        categories + [start_date, end_date],
+        [user_id] + categories + [start_date, end_date],
     )
     spending = {row["category"]: float(row["total_spent"]) for row in rows}
 
@@ -461,10 +532,8 @@ async def fetch_budget_status(month: int, year: int) -> list[dict[str, Any]]:
         remaining = limit_amt - spent
         pct = (spent / limit_amt * 100) if limit_amt > 0 else 0.0
         results.append({
-            "category": cat,
-            "limit_amount": limit_amt,
-            "total_spent": round(spent, 2),
-            "remaining": round(remaining, 2),
+            "category": cat, "limit_amount": limit_amt,
+            "total_spent": round(spent, 2), "remaining": round(remaining, 2),
             "percentage_used": round(pct, 1),
         })
     return results

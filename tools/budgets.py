@@ -1,8 +1,7 @@
 """
 MCP tool implementations for budget management.
 
-Uses FastMCP Context for elicitation — prompts interactively
-for missing budget fields.
+All tools use the module-level ``_DEFAULT_USER_ID`` for per-user scoping.
 """
 
 from __future__ import annotations
@@ -16,6 +15,14 @@ from models.schemas import CategoryEnum, GetBudgetStatusInput, SetBudgetInput
 from db import database as db
 
 logger = logging.getLogger("expense_tracker.tools.budgets")
+
+# Module-level default user_id (set by main.py on startup)
+_DEFAULT_USER_ID: int = 1
+
+
+def set_default_user_id(uid: int) -> None:
+    global _DEFAULT_USER_ID
+    _DEFAULT_USER_ID = uid
 
 
 # ---------------------------------------------------------------------------
@@ -41,53 +48,33 @@ async def set_budget(
     Returns:
         The created or updated budget record.
     """
-    # Elicit missing fields if context is available
     if ctx:
         if not category:
             cats = [c.value for c in CategoryEnum]
             result = await ctx.elicit(
-                f"Which category? Choose from: {', '.join(cats)}",
-                response_type=cats,
+                f"Which category? Choose from: {', '.join(cats)}", response_type=cats,
             )
             if result.action == "accept":
                 category = result.data
 
         if not limit_amount:
-            result = await ctx.elicit(
-                "What is the budget limit amount?",
-                response_type=float,
-            )
+            result = await ctx.elicit("What is the budget limit amount?", response_type=float)
             if result.action == "accept":
                 limit_amount = result.data
 
         if not month:
             now = datetime.utcnow()
-            result = await ctx.elicit(
-                f"Which month? (1-12, default: {now.month})",
-                response_type=int,
-            )
-            if result.action == "accept":
-                month = result.data
-            else:
-                month = now.month
+            result = await ctx.elicit(f"Which month? (1-12, default: {now.month})", response_type=int)
+            month = result.data if result.action == "accept" else now.month
 
         if not year:
             now = datetime.utcnow()
-            result = await ctx.elicit(
-                f"Which year? (default: {now.year})",
-                response_type=int,
-            )
-            if result.action == "accept":
-                year = result.data
-            else:
-                year = now.year
+            result = await ctx.elicit(f"Which year? (default: {now.year})", response_type=int)
+            year = result.data if result.action == "accept" else now.year
 
     try:
         validated = SetBudgetInput(
-            category=category,
-            limit_amount=limit_amount,
-            month=month,
-            year=year,
+            category=category, limit_amount=limit_amount, month=month, year=year,
         )
     except Exception as e:
         logger.warning("Validation failed for set_budget: %s", e)
@@ -95,18 +82,14 @@ async def set_budget(
 
     try:
         record = await db.upsert_budget(
+            user_id=_DEFAULT_USER_ID,
             category=validated.category.value,
             limit_amount=validated.limit_amount,
             month=validated.month,
             year=validated.year,
         )
-        logger.info(
-            "Budget set: %s %s/%s → %.2f",
-            validated.category.value,
-            validated.month,
-            validated.year,
-            validated.limit_amount,
-        )
+        logger.info("Budget set: %s %s/%s → %.2f",
+                     validated.category.value, validated.month, validated.year, validated.limit_amount)
         return {"message": "Budget set successfully.", "budget": record}
     except Exception as e:
         logger.error("Database error in set_budget: %s", e)
@@ -141,19 +124,15 @@ async def get_budget_status(
     target_year = validated.year or now.year
 
     try:
-        rows = await db.fetch_budget_status(month=target_month, year=target_year)
+        rows = await db.fetch_budget_status(
+            user_id=_DEFAULT_USER_ID, month=target_month, year=target_year,
+        )
         if not rows:
             return {
-                "month": target_month,
-                "year": target_year,
-                "message": "No budgets set for this period.",
-                "statuses": [],
+                "month": target_month, "year": target_year,
+                "message": "No budgets set for this period.", "statuses": [],
             }
-        return {
-            "month": target_month,
-            "year": target_year,
-            "statuses": rows,
-        }
+        return {"month": target_month, "year": target_year, "statuses": rows}
     except Exception as e:
         logger.error("Database error in get_budget_status: %s", e)
         return {"error": f"Failed to get budget status: {e}"}
