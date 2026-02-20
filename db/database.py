@@ -1,12 +1,15 @@
 """
-MySQL database layer for the Expense Tracker MCP server.
+Database layer for the Expense Tracker MCP server.
 
-Uses aiomysql for async database operations.  Connection parameters
-are read from environment variables (MYSQL_HOST, MYSQL_PORT,
-MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE).
+Supports **two backends** selected by the ``DB_BACKEND`` env var:
 
-Call ``init_db()`` on server startup to auto-create the database
-and tables.
+* ``mysql``  — Uses aiomysql (default when MYSQL_PASSWORD is set)
+* ``sqlite`` — Uses aiosqlite  (default fallback / FastMCP Cloud)
+
+All CRUD functions are backend-agnostic; the internal helpers
+abstract away the differences.
+
+Call ``init_db()`` on server startup to auto-create tables.
 """
 
 from __future__ import annotations
@@ -14,18 +17,43 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
-
-import aiomysql
 
 logger = logging.getLogger("expense_tracker.db")
 
 # ---------------------------------------------------------------------------
-# Connection helpers
+# Backend detection
 # ---------------------------------------------------------------------------
 
-def _get_conn_params() -> dict[str, Any]:
-    """Return MySQL connection parameters from environment variables."""
+def _use_mysql() -> bool:
+    """Return True if we should use the MySQL backend."""
+    explicit = os.getenv("DB_BACKEND", "").lower()
+    if explicit == "mysql":
+        return True
+    if explicit == "sqlite":
+        return False
+    # Auto-detect: use MySQL only if password is configured
+    return bool(os.getenv("MYSQL_PASSWORD"))
+
+
+USE_MYSQL = _use_mysql()
+
+if USE_MYSQL:
+    import aiomysql        # type: ignore[import-untyped]
+else:
+    import aiosqlite       # type: ignore[import-untyped]
+
+logger.info("Database backend: %s", "MySQL" if USE_MYSQL else "SQLite")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Connection helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ---- MySQL ----------------------------------------------------------------
+
+def _get_mysql_params() -> dict[str, Any]:
     return {
         "host": os.getenv("MYSQL_HOST", "localhost"),
         "port": int(os.getenv("MYSQL_PORT", "3306")),
@@ -36,19 +64,14 @@ def _get_conn_params() -> dict[str, Any]:
     }
 
 
-async def get_connection() -> aiomysql.Connection:
-    """Open and return an aiomysql connection."""
-    params = _get_conn_params()
-    conn = await aiomysql.connect(**params)
-    return conn
+async def _mysql_connection() -> aiomysql.Connection:
+    return await aiomysql.connect(**_get_mysql_params())
 
 
-async def _ensure_database_exists() -> None:
-    """Create the database if it does not exist yet."""
-    params = _get_conn_params()
+async def _mysql_ensure_database() -> None:
+    params = _get_mysql_params()
     db_name = params.pop("db")
     params.pop("autocommit", None)
-
     conn = await aiomysql.connect(**params, autocommit=True)
     try:
         async with conn.cursor() as cur:
@@ -60,11 +83,28 @@ async def _ensure_database_exists() -> None:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Schema initialisation
-# ---------------------------------------------------------------------------
+# ---- SQLite ---------------------------------------------------------------
 
-_EXPENSES_TABLE = """
+def _get_sqlite_path() -> str:
+    db_path = os.getenv("DATABASE_PATH", "expenses.db")
+    if not os.path.isabs(db_path):
+        db_path = str(Path(__file__).resolve().parent.parent / db_path)
+    return db_path
+
+
+async def _sqlite_connection() -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(_get_sqlite_path())
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Schema initialisation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_MYSQL_EXPENSES_TABLE = """
 CREATE TABLE IF NOT EXISTS expenses (
     id          INT AUTO_INCREMENT PRIMARY KEY,
     title       VARCHAR(200)   NOT NULL,
@@ -79,7 +119,7 @@ CREATE TABLE IF NOT EXISTS expenses (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
-_BUDGETS_TABLE = """
+_MYSQL_BUDGETS_TABLE = """
 CREATE TABLE IF NOT EXISTS budgets (
     id            INT AUTO_INCREMENT PRIMARY KEY,
     category      VARCHAR(50)    NOT NULL,
@@ -91,56 +131,81 @@ CREATE TABLE IF NOT EXISTS budgets (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+_SQLITE_EXPENSES_TABLE = """
+CREATE TABLE IF NOT EXISTS expenses (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT    NOT NULL,
+    amount      REAL    NOT NULL,
+    category    TEXT    NOT NULL,
+    date        TEXT    NOT NULL,
+    notes       TEXT,
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+"""
+
+_SQLITE_BUDGETS_TABLE = """
+CREATE TABLE IF NOT EXISTS budgets (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    category      TEXT    NOT NULL,
+    limit_amount  REAL    NOT NULL,
+    month         INTEGER NOT NULL,
+    year          INTEGER NOT NULL,
+    UNIQUE(category, month, year)
+);
+"""
+
+_SQLITE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);",
+    "CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);",
+    "CREATE INDEX IF NOT EXISTS idx_budgets_month_year ON budgets(month, year);",
+]
+
 
 async def init_db() -> None:
     """Create the database (if needed) and tables."""
-    await _ensure_database_exists()
-
-    db_name = os.getenv("MYSQL_DATABASE", "expense_tracker")
-    logger.info("Initialising MySQL database '%s'", db_name)
-
-    conn = await get_connection()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(_EXPENSES_TABLE)
-            await cur.execute(_BUDGETS_TABLE)
-        await conn.commit()
-    finally:
-        conn.close()
+    if USE_MYSQL:
+        await _mysql_ensure_database()
+        db_name = os.getenv("MYSQL_DATABASE", "expense_tracker")
+        logger.info("Initialising MySQL database '%s'", db_name)
+        conn = await _mysql_connection()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(_MYSQL_EXPENSES_TABLE)
+                await cur.execute(_MYSQL_BUDGETS_TABLE)
+            await conn.commit()
+        finally:
+            conn.close()
+    else:
+        db_path = _get_sqlite_path()
+        logger.info("Initialising SQLite database at %s", db_path)
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(_SQLITE_EXPENSES_TABLE)
+            await conn.execute(_SQLITE_BUDGETS_TABLE)
+            for idx in _SQLITE_INDEXES:
+                await conn.execute(idx)
+            await conn.commit()
 
     logger.info("Database initialised successfully.")
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# Internal helpers — abstract away backend differences
+# ═══════════════════════════════════════════════════════════════════════════
 
-async def _fetchall(query: str, params: tuple | list = ()) -> list[dict[str, Any]]:
-    """Execute a SELECT and return all rows as list of dicts."""
-    conn = await get_connection()
-    try:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query, params)
-            rows = await cur.fetchall()
-            return list(rows)
-    finally:
-        conn.close()
+def _ph(name: str = "") -> str:
+    """Return the placeholder string for the current backend."""
+    return "%s" if USE_MYSQL else "?"
 
 
-async def _fetchone(query: str, params: tuple | list = ()) -> Optional[dict[str, Any]]:
-    """Execute a SELECT and return a single row as dict or None."""
-    conn = await get_connection()
-    try:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query, params)
-            row = await cur.fetchone()
-            return dict(row) if row else None
-    finally:
-        conn.close()
+def _phs(count: int) -> str:
+    """Return comma-separated placeholders."""
+    p = "%s" if USE_MYSQL else "?"
+    return ", ".join(p for _ in range(count))
 
 
 def _serialise_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert non-JSON-serialisable types (date, datetime, Decimal) to strings/floats."""
+    """Convert Decimal / date / datetime to JSON-safe types."""
     import decimal
     from datetime import date as date_type, datetime as dt_type
 
@@ -157,9 +222,64 @@ def _serialise_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-# ---------------------------------------------------------------------------
+async def _fetchall(query: str, params: tuple | list = ()) -> list[dict[str, Any]]:
+    if USE_MYSQL:
+        conn = await _mysql_connection()
+        try:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(query, params)
+                return list(await cur.fetchall())
+        finally:
+            conn.close()
+    else:
+        async with await _sqlite_connection() as conn:
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def _fetchone(query: str, params: tuple | list = ()) -> Optional[dict[str, Any]]:
+    if USE_MYSQL:
+        conn = await _mysql_connection()
+        try:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(query, params)
+                row = await cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            conn.close()
+    else:
+        async with await _sqlite_connection() as conn:
+            cursor = await conn.execute(query, params)
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def _execute(query: str, params: tuple | list = ()) -> tuple[int, int]:
+    """Execute an INSERT/UPDATE/DELETE. Returns (lastrowid, rowcount)."""
+    if USE_MYSQL:
+        conn = await _mysql_connection()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(query, params)
+                lid, rc = cur.lastrowid, cur.rowcount
+            await conn.commit()
+            return lid, rc
+        finally:
+            conn.close()
+    else:
+        async with await _sqlite_connection() as conn:
+            cursor = await conn.execute(query, params)
+            await conn.commit()
+            return cursor.lastrowid, cursor.rowcount
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CRUD — Expenses
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+
+P = "%s" if USE_MYSQL else "?"   # module-level shorthand
+
 
 async def insert_expense(
     title: str,
@@ -168,32 +288,18 @@ async def insert_expense(
     date: str,
     notes: Optional[str],
 ) -> dict[str, Any]:
-    """Insert a new expense and return the created row as a dict."""
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    conn = await get_connection()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO expenses (title, amount, category, date, notes, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (title, amount, category, date, notes, now, now),
-            )
-            row_id = cur.lastrowid
-        await conn.commit()
-    finally:
-        conn.close()
-
+    lid, _ = await _execute(
+        f"""
+        INSERT INTO expenses (title, amount, category, date, notes, created_at, updated_at)
+        VALUES ({P}, {P}, {P}, {P}, {P}, {P}, {P})
+        """,
+        (title, amount, category, date, notes, now, now),
+    )
     return {
-        "id": row_id,
-        "title": title,
-        "amount": amount,
-        "category": category,
-        "date": date,
-        "notes": notes,
-        "created_at": now,
-        "updated_at": now,
+        "id": lid, "title": title, "amount": amount,
+        "category": category, "date": date, "notes": notes,
+        "created_at": now, "updated_at": now,
     }
 
 
@@ -203,21 +309,18 @@ async def fetch_expenses(
     end_date: Optional[str] = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """Fetch expenses with optional filters."""
     query = "SELECT * FROM expenses WHERE 1=1"
     params: list[Any] = []
-
     if category:
-        query += " AND category = %s"
+        query += f" AND category = {P}"
         params.append(category)
     if start_date:
-        query += " AND date >= %s"
+        query += f" AND date >= {P}"
         params.append(start_date)
     if end_date:
-        query += " AND date <= %s"
+        query += f" AND date <= {P}"
         params.append(end_date)
-
-    query += " ORDER BY date DESC LIMIT %s"
+    query += f" ORDER BY date DESC LIMIT {P}"
     params.append(limit)
 
     rows = await _fetchall(query, params)
@@ -225,91 +328,65 @@ async def fetch_expenses(
 
 
 async def fetch_expense_by_id(expense_id: int) -> Optional[dict[str, Any]]:
-    """Fetch a single expense by ID."""
-    row = await _fetchone("SELECT * FROM expenses WHERE id = %s", (expense_id,))
+    row = await _fetchone(f"SELECT * FROM expenses WHERE id = {P}", (expense_id,))
     return _serialise_row(row) if row else None
 
 
 async def update_expense(expense_id: int, **fields: Any) -> Optional[dict[str, Any]]:
-    """Update specified fields of an expense.  Returns updated row or None."""
     if not fields:
         return await fetch_expense_by_id(expense_id)
-
     fields["updated_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    set_clause = ", ".join(f"{k} = %s" for k in fields)
+    set_clause = ", ".join(f"{k} = {P}" for k in fields)
     values = list(fields.values()) + [expense_id]
-
-    conn = await get_connection()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                f"UPDATE expenses SET {set_clause} WHERE id = %s",
-                values,
-            )
-        await conn.commit()
-    finally:
-        conn.close()
-
+    await _execute(f"UPDATE expenses SET {set_clause} WHERE id = {P}", values)
     return await fetch_expense_by_id(expense_id)
 
 
 async def delete_expense(expense_id: int) -> bool:
-    """Delete an expense.  Returns True if a row was deleted."""
-    conn = await get_connection()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute("DELETE FROM expenses WHERE id = %s", (expense_id,))
-            affected = cur.rowcount
-        await conn.commit()
-        return affected > 0
-    finally:
-        conn.close()
+    _, rc = await _execute(f"DELETE FROM expenses WHERE id = {P}", (expense_id,))
+    return rc > 0
 
 
 async def fetch_spending_summary(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Return aggregated spending grouped by category."""
-    query = """
+    sum_expr = "CAST(SUM(amount) AS DOUBLE)" if USE_MYSQL else "SUM(amount)"
+    query = f"""
         SELECT category,
-               CAST(SUM(amount) AS DOUBLE) AS total_spent,
-               COUNT(*)                    AS transaction_count
-        FROM expenses
-        WHERE 1=1
+               {sum_expr} AS total_spent,
+               COUNT(*)   AS transaction_count
+        FROM expenses WHERE 1=1
     """
     params: list[Any] = []
     if start_date:
-        query += " AND date >= %s"
+        query += f" AND date >= {P}"
         params.append(start_date)
     if end_date:
-        query += " AND date <= %s"
+        query += f" AND date <= {P}"
         params.append(end_date)
     query += " GROUP BY category ORDER BY total_spent DESC"
-
     rows = await _fetchall(query, params)
     return [_serialise_row(r) for r in rows]
 
 
 async def fetch_top_expenses(n: int = 5) -> list[dict[str, Any]]:
-    """Return the top-N most expensive items."""
     rows = await _fetchall(
-        "SELECT * FROM expenses ORDER BY amount DESC LIMIT %s", (n,)
+        f"SELECT * FROM expenses ORDER BY amount DESC LIMIT {P}", (n,)
     )
     return [_serialise_row(r) for r in rows]
 
 
 async def fetch_all_categories() -> list[str]:
-    """Return a sorted list of distinct categories that have been used."""
     rows = await _fetchall(
         "SELECT DISTINCT category FROM expenses ORDER BY category"
     )
     return [row["category"] for row in rows]
 
 
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 # CRUD — Budgets
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def upsert_budget(
     category: str,
@@ -317,36 +394,36 @@ async def upsert_budget(
     month: int,
     year: int,
 ) -> dict[str, Any]:
-    """Insert or update a budget entry.  Returns the upserted row."""
-    conn = await get_connection()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO budgets (category, limit_amount, month, year)
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE limit_amount = VALUES(limit_amount)
-                """,
-                (category, limit_amount, month, year),
-            )
-        await conn.commit()
-    finally:
-        conn.close()
+    if USE_MYSQL:
+        await _execute(
+            f"""
+            INSERT INTO budgets (category, limit_amount, month, year)
+            VALUES ({P}, {P}, {P}, {P})
+            ON DUPLICATE KEY UPDATE limit_amount = VALUES(limit_amount)
+            """,
+            (category, limit_amount, month, year),
+        )
+    else:
+        await _execute(
+            f"""
+            INSERT INTO budgets (category, limit_amount, month, year)
+            VALUES ({P}, {P}, {P}, {P})
+            ON CONFLICT(category, month, year)
+            DO UPDATE SET limit_amount = excluded.limit_amount
+            """,
+            (category, limit_amount, month, year),
+        )
 
     row = await _fetchone(
-        "SELECT * FROM budgets WHERE category = %s AND month = %s AND year = %s",
+        f"SELECT * FROM budgets WHERE category = {P} AND month = {P} AND year = {P}",
         (category, month, year),
     )
     return _serialise_row(row) if row else {}
 
 
-async def fetch_budget_status(
-    month: int,
-    year: int,
-) -> list[dict[str, Any]]:
-    """Compare budgets vs actual spending for a given month/year."""
+async def fetch_budget_status(month: int, year: int) -> list[dict[str, Any]]:
     budgets = await _fetchall(
-        "SELECT * FROM budgets WHERE month = %s AND year = %s",
+        f"SELECT * FROM budgets WHERE month = {P} AND year = {P}",
         (month, year),
     )
     if not budgets:
@@ -354,23 +431,22 @@ async def fetch_budget_status(
 
     budgets = [_serialise_row(b) for b in budgets]
 
-    # Build date range for the month
     start_date = f"{year}-{month:02d}-01"
     if month == 12:
         end_date = f"{year + 1}-01-01"
     else:
         end_date = f"{year}-{month + 1:02d}-01"
 
-    # Get spending for those categories in that month
-    placeholders = ", ".join("%s" for _ in budgets)
+    placeholders = _phs(len(budgets))
     categories = [b["category"] for b in budgets]
+    sum_expr = "CAST(SUM(amount) AS DOUBLE)" if USE_MYSQL else "SUM(amount)"
 
     rows = await _fetchall(
         f"""
-        SELECT category, CAST(SUM(amount) AS DOUBLE) AS total_spent
+        SELECT category, {sum_expr} AS total_spent
         FROM expenses
         WHERE category IN ({placeholders})
-          AND date >= %s AND date < %s
+          AND date >= {P} AND date < {P}
         GROUP BY category
         """,
         categories + [start_date, end_date],
@@ -391,5 +467,4 @@ async def fetch_budget_status(
             "remaining": round(remaining, 2),
             "percentage_used": round(pct, 1),
         })
-
     return results
