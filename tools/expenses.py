@@ -1,18 +1,21 @@
 """
 MCP tool implementations for expense management.
 
-Each function is decorated with ``@mcp.tool()`` at registration time
-in ``main.py``.  The functions here are plain async callables that
-accept validated input dicts and return JSON-serialisable results.
+Uses FastMCP Context for elicitation — if a required field is missing,
+the server prompts the user interactively before proceeding.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+from fastmcp import Context
 
 from models.schemas import (
     AddExpenseInput,
+    CategoryEnum,
     DeleteExpenseInput,
     GetExpensesInput,
     GetSummaryInput,
@@ -25,6 +28,57 @@ logger = logging.getLogger("expense_tracker.tools.expenses")
 
 
 # ---------------------------------------------------------------------------
+# Elicitation helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConfirmDelete:
+    """Elicitation schema for delete confirmation."""
+    confirm: str
+
+
+async def _elicit_missing_fields(
+    ctx: Context,
+    title: str | None,
+    amount: float | None,
+    category: str | None,
+    date: str | None,
+) -> tuple[str | None, float | None, str | None, str | None]:
+    """Prompt the user for any missing required expense fields via elicitation."""
+    if not title:
+        result = await ctx.elicit("What is the expense title?", response_type=str)
+        if result.action == "accept":
+            title = result.data
+
+    if not amount:
+        result = await ctx.elicit("What is the expense amount?", response_type=float)
+        if result.action == "accept":
+            amount = result.data
+
+    if not category:
+        cats = [c.value for c in CategoryEnum]
+        result = await ctx.elicit(
+            f"Choose a category: {', '.join(cats)}",
+            response_type=cats,
+        )
+        if result.action == "accept":
+            category = result.data
+
+    if not date:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        result = await ctx.elicit(
+            f"What date? (YYYY-MM-DD, default: {today})",
+            response_type=str,
+        )
+        if result.action == "accept":
+            date = result.data or today
+        else:
+            date = today
+
+    return title, amount, category, date
+
+
+# ---------------------------------------------------------------------------
 # add_expense
 # ---------------------------------------------------------------------------
 
@@ -34,6 +88,7 @@ async def add_expense(
     category: str,
     date: str,
     notes: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Add a new expense record.
 
@@ -43,10 +98,17 @@ async def add_expense(
         category: One of Food, Travel, Bills, Entertainment, Health, Shopping, Education, Other.
         date: Expense date in YYYY-MM-DD format.
         notes: Optional notes (max 500 chars).
+        ctx: MCP Context for elicitation (auto-injected).
 
     Returns:
         The created expense record with its new ID.
     """
+    # Elicit missing required fields if context is available
+    if ctx and (not title or not amount or not category or not date):
+        title, amount, category, date = await _elicit_missing_fields(
+            ctx, title, amount, category, date
+        )
+
     try:
         validated = AddExpenseInput(
             title=title,
@@ -157,12 +219,10 @@ async def update_expense(
         logger.warning("Validation failed for update_expense: %s", e)
         return {"error": f"Validation error: {e}"}
 
-    # Check existence first
     existing = await db.fetch_expense_by_id(validated.id)
     if not existing:
         return {"error": f"Expense with ID {validated.id} not found."}
 
-    # Build update fields
     fields: dict = {}
     if validated.title is not None:
         fields["title"] = validated.title
@@ -188,14 +248,15 @@ async def update_expense(
 
 
 # ---------------------------------------------------------------------------
-# delete_expense
+# delete_expense (with elicitation confirmation)
 # ---------------------------------------------------------------------------
 
-async def delete_expense(id: int) -> dict:
+async def delete_expense(id: int, ctx: Context | None = None) -> dict:
     """Delete an expense by ID.
 
     Args:
         id: The expense ID to delete.
+        ctx: MCP Context for elicitation (auto-injected).
 
     Returns:
         Success or not-found message.
@@ -205,6 +266,21 @@ async def delete_expense(id: int) -> dict:
     except Exception as e:
         logger.warning("Validation failed for delete_expense: %s", e)
         return {"error": f"Validation error: {e}"}
+
+    # Confirm deletion with the user via elicitation
+    if ctx:
+        existing = await db.fetch_expense_by_id(validated.id)
+        if not existing:
+            return {"error": f"Expense with ID {validated.id} not found."}
+
+        result = await ctx.elicit(
+            f"Are you sure you want to delete expense #{validated.id} "
+            f"'{existing.get('title', '')}' (₹{existing.get('amount', 0)})? "
+            f"Type 'yes' to confirm.",
+            response_type=["yes", "no"],
+        )
+        if result.action != "accept" or result.data != "yes":
+            return {"message": "Deletion cancelled by user."}
 
     try:
         deleted = await db.delete_expense(validated.id)
@@ -242,13 +318,12 @@ async def get_summary(period: str | None = "monthly") -> dict:
     end_date: str | None = None
 
     if validated.period == "weekly":
-        start = today - timedelta(days=today.weekday())  # Monday
+        start = today - timedelta(days=today.weekday())
         start_date = start.isoformat()
         end_date = today.isoformat()
     elif validated.period == "monthly":
         start_date = today.replace(day=1).isoformat()
         end_date = today.isoformat()
-    # 'all' → no date filters
 
     try:
         rows = await db.fetch_spending_summary(start_date=start_date, end_date=end_date)

@@ -1,5 +1,8 @@
 """
 MCP tool implementations for budget management.
+
+Uses FastMCP Context for elicitation — prompts interactively
+for missing budget fields.
 """
 
 from __future__ import annotations
@@ -7,21 +10,24 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from models.schemas import GetBudgetStatusInput, SetBudgetInput
+from fastmcp import Context
+
+from models.schemas import CategoryEnum, GetBudgetStatusInput, SetBudgetInput
 from db import database as db
 
 logger = logging.getLogger("expense_tracker.tools.budgets")
 
 
 # ---------------------------------------------------------------------------
-# set_budget
+# set_budget (with elicitation)
 # ---------------------------------------------------------------------------
 
 async def set_budget(
-    category: str,
-    limit_amount: float,
-    month: int,
-    year: int,
+    category: str | None = None,
+    limit_amount: float | None = None,
+    month: int | None = None,
+    year: int | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Set or update a monthly budget for a category.
 
@@ -30,10 +36,52 @@ async def set_budget(
         limit_amount: The budget limit amount (must be > 0).
         month: Month number (1-12).
         year: Year (2000-2100).
+        ctx: MCP Context for elicitation (auto-injected).
 
     Returns:
         The created or updated budget record.
     """
+    # Elicit missing fields if context is available
+    if ctx:
+        if not category:
+            cats = [c.value for c in CategoryEnum]
+            result = await ctx.elicit(
+                f"Which category? Choose from: {', '.join(cats)}",
+                response_type=cats,
+            )
+            if result.action == "accept":
+                category = result.data
+
+        if not limit_amount:
+            result = await ctx.elicit(
+                "What is the budget limit amount?",
+                response_type=float,
+            )
+            if result.action == "accept":
+                limit_amount = result.data
+
+        if not month:
+            now = datetime.utcnow()
+            result = await ctx.elicit(
+                f"Which month? (1-12, default: {now.month})",
+                response_type=int,
+            )
+            if result.action == "accept":
+                month = result.data
+            else:
+                month = now.month
+
+        if not year:
+            now = datetime.utcnow()
+            result = await ctx.elicit(
+                f"Which year? (default: {now.year})",
+                response_type=int,
+            )
+            if result.action == "accept":
+                year = result.data
+            else:
+                year = now.year
+
     try:
         validated = SetBudgetInput(
             category=category,
