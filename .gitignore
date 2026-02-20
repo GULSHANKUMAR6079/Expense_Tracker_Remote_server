@@ -1,44 +1,6 @@
-# =========================
-# Environment files (SECRETS)
-# =========================
-.env
-.env.*
-*.env
-
-# =========================
-# Python
-# =========================
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
-venv/
-.env/
-.venv/
-ENV/
-
-# Python version
-.python-version
-
-# =========================
-# VS Code
-# =========================
-.vscode/
-
-# =========================
-# OS files
-# =========================
-.DS_Store
-Thumbs.db
-
-# =========================
-# Logs
-# =========================
+﻿logs/
 *.log
-
-# =========================
-# Build
-# =========================
-build/
-dist/
+__pycache__/
+*.pyc
+.env
+expenses.db
