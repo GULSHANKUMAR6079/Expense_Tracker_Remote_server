@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from db import database as db
 
@@ -52,7 +52,7 @@ async def get_expense_summary() -> str:
     Resource URI: expense://summary
     """
     try:
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         start_date = today.replace(day=1).isoformat()
         end_date = today.isoformat()
 
@@ -97,7 +97,7 @@ async def get_budget_status_resource() -> str:
     Resource URI: budget://status
     """
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         rows = await db.fetch_budget_status(
             user_id=_DEFAULT_USER_ID, month=now.month, year=now.year,
         )

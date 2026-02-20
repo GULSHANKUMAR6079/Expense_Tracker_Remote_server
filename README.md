@@ -143,6 +143,9 @@ Restart Claude Desktop after saving the config.
 | `get_top_expenses(n?)` | Top N highest expenses |
 | `set_budget(category, limit_amount, month, year)` | Set a monthly budget |
 | `get_budget_status(month?, year?)` | Budget vs actual spending |
+| `register_user(name, email?)` | Create a new user (returns API key) |
+| `switch_user(api_key)` | Switch active user by API key |
+| `list_users()` | List all registered users |
 
 ## 📚 Available MCP Resources
 
@@ -157,11 +160,22 @@ Restart Claude Desktop after saving the config.
 
 ## 🗄️ Database Schema
 
+### `users` table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INT (PK, AUTO_INCREMENT) | Unique ID |
+| `name` | VARCHAR(100) | Display name |
+| `email` | VARCHAR(200) | Optional email |
+| `api_key` | VARCHAR(64) | Unique API key |
+| `created_at` | DATETIME | Record creation time |
+
 ### `expenses` table
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INT (PK, AUTO_INCREMENT) | Unique ID |
+| `user_id` | INT (FK → users) | Owner user |
 | `title` | VARCHAR(200) | Expense title |
 | `amount` | DECIMAL(12,2) | Amount spent |
 | `category` | VARCHAR(50) | Category name |
@@ -175,6 +189,7 @@ Restart Claude Desktop after saving the config.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INT (PK, AUTO_INCREMENT) | Unique ID |
+| `user_id` | INT (FK → users) | Owner user |
 | `category` | VARCHAR(50) | Category name |
 | `limit_amount` | DECIMAL(12,2) | Monthly budget limit |
 | `month` | INT | Month (1-12) |

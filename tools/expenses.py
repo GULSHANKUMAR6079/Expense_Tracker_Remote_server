@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastmcp import Context
 
@@ -69,7 +69,7 @@ async def _elicit_missing_fields(
             category = result.data
 
     if not date:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         result = await ctx.elicit(
             f"What date? (YYYY-MM-DD, default: {today})", response_type=str,
         )
@@ -304,7 +304,7 @@ async def get_summary(period: str | None = "monthly") -> dict:
         logger.warning("Validation failed for get_summary: %s", e)
         return {"error": f"Validation error: {e}"}
 
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     start_date: str | None = None
     end_date: str | None = None
 

@@ -7,7 +7,7 @@ All tools use the module-level ``_DEFAULT_USER_ID`` for per-user scoping.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastmcp import Context
 
@@ -63,7 +63,7 @@ async def set_budget(
                 limit_amount = result.data
 
         if not month:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             result = await ctx.elicit(f"Which month? (1-12, default: {now.month})", response_type=int)
             month = result.data if result.action == "accept" else now.month
 
@@ -119,7 +119,7 @@ async def get_budget_status(
         logger.warning("Validation failed for get_budget_status: %s", e)
         return {"error": f"Validation error: {e}"}
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     target_month = validated.month or now.month
     target_year = validated.year or now.year
 

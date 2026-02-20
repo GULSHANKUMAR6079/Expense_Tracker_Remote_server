@@ -17,7 +17,7 @@ import hashlib
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -45,6 +45,24 @@ else:
 
 logger.info("Database backend: %s", "MySQL" if USE_MYSQL else "SQLite")
 
+# ---------------------------------------------------------------------------
+# Connection pool (MySQL only)
+# ---------------------------------------------------------------------------
+
+_pool: aiomysql.Pool | None = None if USE_MYSQL else None
+
+
+async def _get_pool() -> aiomysql.Pool:
+    """Return (and lazily create) a MySQL connection pool."""
+    global _pool
+    if _pool is None or _pool.closed:
+        _pool = await aiomysql.create_pool(
+            **_get_mysql_params(),
+            minsize=1,
+            maxsize=5,
+        )
+    return _pool
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Connection helpers
@@ -62,7 +80,8 @@ def _get_mysql_params() -> dict[str, Any]:
 
 
 async def _mysql_connection():
-    return await aiomysql.connect(**_get_mysql_params())
+    pool = await _get_pool()
+    return await pool.acquire()
 
 
 async def _mysql_ensure_database() -> None:
@@ -208,6 +227,8 @@ async def init_db() -> None:
             await conn.commit()
         finally:
             conn.close()
+        # Ensure user_id column exists (migration for pre-multi-user tables)
+        await _ensure_user_id_columns()
     else:
         logger.info("Initialising SQLite database at %s", _get_sqlite_path())
         async with aiosqlite.connect(_get_sqlite_path()) as conn:
@@ -221,6 +242,34 @@ async def init_db() -> None:
     # Create a default user if none exists
     await _ensure_default_user()
     logger.info("Database initialised successfully.")
+
+
+async def _ensure_user_id_columns() -> None:
+    """Add user_id column to expenses/budgets if missing (migration)."""
+    if not USE_MYSQL:
+        return
+    conn = await _mysql_connection()
+    try:
+        async with conn.cursor() as cur:
+            for table in ("expenses", "budgets"):
+                await cur.execute(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'user_id'",
+                    (os.getenv("MYSQL_DATABASE", "expense_tracker"), table),
+                )
+                (count,) = await cur.fetchone()
+                if count == 0:
+                    logger.warning("Migrating table '%s': adding user_id column ...", table)
+                    await cur.execute(
+                        f"ALTER TABLE `{table}` ADD COLUMN user_id INT NOT NULL DEFAULT 1 AFTER id"
+                    )
+                    await cur.execute(
+                        f"ALTER TABLE `{table}` ADD FOREIGN KEY (user_id) REFERENCES users(id)"
+                    )
+                    logger.info("Migration complete for table '%s'.", table)
+        await conn.commit()
+    finally:
+        conn.close()
 
 
 async def _ensure_default_user() -> None:
@@ -261,13 +310,11 @@ def _serialise_row(row: dict[str, Any]) -> dict[str, Any]:
 
 async def _fetchall(query: str, params: tuple | list = ()) -> list[dict[str, Any]]:
     if USE_MYSQL:
-        conn = await _mysql_connection()
-        try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(query, params)
                 return list(await cur.fetchall())
-        finally:
-            conn.close()
     else:
         async with await _sqlite_connection() as conn:
             cursor = await conn.execute(query, params)
@@ -277,14 +324,12 @@ async def _fetchall(query: str, params: tuple | list = ()) -> list[dict[str, Any
 
 async def _fetchone(query: str, params: tuple | list = ()) -> Optional[dict[str, Any]]:
     if USE_MYSQL:
-        conn = await _mysql_connection()
-        try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(query, params)
                 row = await cur.fetchone()
                 return dict(row) if row else None
-        finally:
-            conn.close()
     else:
         async with await _sqlite_connection() as conn:
             cursor = await conn.execute(query, params)
@@ -294,15 +339,13 @@ async def _fetchone(query: str, params: tuple | list = ()) -> Optional[dict[str,
 
 async def _execute(query: str, params: tuple | list = ()) -> tuple[int, int]:
     if USE_MYSQL:
-        conn = await _mysql_connection()
-        try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(query, params)
                 lid, rc = cur.lastrowid, cur.rowcount
             await conn.commit()
             return lid, rc
-        finally:
-            conn.close()
     else:
         async with await _sqlite_connection() as conn:
             cursor = await conn.execute(query, params)
@@ -322,7 +365,7 @@ async def create_user(
     """Create a new user with a unique API key. Returns the user record."""
     if not api_key:
         api_key = secrets.token_hex(32)  # 64-char hex key
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     lid, _ = await _execute(
         f"INSERT INTO users (name, email, api_key, created_at) VALUES ({P}, {P}, {P}, {P})",
@@ -355,7 +398,7 @@ async def insert_expense(
     date: str,
     notes: Optional[str],
 ) -> dict[str, Any]:
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     lid, _ = await _execute(
         f"""
         INSERT INTO expenses (user_id, title, amount, category, date, notes, created_at, updated_at)
@@ -405,7 +448,7 @@ async def fetch_expense_by_id(user_id: int, expense_id: int) -> Optional[dict[st
 async def update_expense(user_id: int, expense_id: int, **fields: Any) -> Optional[dict[str, Any]]:
     if not fields:
         return await fetch_expense_by_id(user_id, expense_id)
-    fields["updated_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     set_clause = ", ".join(f"{k} = {P}" for k in fields)
     values = list(fields.values()) + [expense_id, user_id]
     await _execute(f"UPDATE expenses SET {set_clause} WHERE id = {P} AND user_id = {P}", values)
@@ -473,8 +516,8 @@ async def upsert_budget(
         await _execute(
             f"""
             INSERT INTO budgets (user_id, category, limit_amount, month, year)
-            VALUES ({P}, {P}, {P}, {P}, {P})
-            ON DUPLICATE KEY UPDATE limit_amount = VALUES(limit_amount)
+            VALUES ({P}, {P}, {P}, {P}, {P}) AS new_val
+            ON DUPLICATE KEY UPDATE limit_amount = new_val.limit_amount
             """,
             (user_id, category, limit_amount, month, year),
         )
