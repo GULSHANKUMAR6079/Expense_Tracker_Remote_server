@@ -33,20 +33,13 @@ if str(PROJECT_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _configure_logging() -> None:
-    """Set up dual logging: console + logs/app.log."""
+    """Set up dual logging: console + file (if writable)."""
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    log_dir = PROJECT_ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    # File handler
-    fh = logging.FileHandler(log_dir / "app.log", encoding="utf-8")
-    fh.setLevel(log_level)
-    fh.setFormatter(fmt)
 
     # Console handler (stderr so it doesn't interfere with stdio transport)
     ch = logging.StreamHandler(sys.stderr)
@@ -55,8 +48,19 @@ def _configure_logging() -> None:
 
     root = logging.getLogger()
     root.setLevel(log_level)
-    root.addHandler(fh)
     root.addHandler(ch)
+
+    # File handler — try project logs/, then /tmp, skip if read-only
+    for log_path in [PROJECT_ROOT / "logs", Path("/tmp")]:
+        try:
+            log_path.mkdir(exist_ok=True)
+            fh = logging.FileHandler(log_path / "app.log", encoding="utf-8")
+            fh.setLevel(log_level)
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+            break
+        except OSError:
+            continue
 
 
 _configure_logging()
