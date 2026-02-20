@@ -49,10 +49,10 @@ logger.info("Database backend: %s", "MySQL" if USE_MYSQL else "SQLite")
 # Connection pool (MySQL only)
 # ---------------------------------------------------------------------------
 
-_pool: aiomysql.Pool | None = None if USE_MYSQL else None
+_pool: Any = None
 
 
-async def _get_pool() -> aiomysql.Pool:
+async def _get_pool():  # -> aiomysql.Pool
     """Return (and lazily create) a MySQL connection pool."""
     global _pool
     if _pool is None or _pool.closed:
